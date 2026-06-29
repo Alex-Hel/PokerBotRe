@@ -5,3 +5,4 @@ __pycache__/
 cookie_file.pkl
 chromium.zip
 chromium/
+AGENTS.md

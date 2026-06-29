@@ -8,6 +8,9 @@ import time
 import requests
 import zipfile
 from selenium.common.exceptions import JavascriptException, NoAlertPresentException, StaleElementReferenceException, TimeoutException, UnexpectedAlertPresentException
+from selenium.webdriver.common.by import By
+
+from PokerState import PokerEvent, PokerEventDetector, PokerTableScraper, PokerTableState
 
 
 class GameManager:
@@ -17,8 +20,12 @@ class GameManager:
     gm = None
     mouse_x = None
     mouse_y = None
+    table_scraper = None
+    table_state = None
+    previous_table_state = None
+    table_events = None
 
-    def __init__(self) -> None:
+    def __init__(self, hero_name: str | None = None) -> None:
         options = webdriver.ChromeOptions()
         options.add_argument('--no-sandbox')
         options.add_argument('--disable-dev-shm-usage')
@@ -41,6 +48,11 @@ class GameManager:
         self.mouse_x = None
         self.mouse_y = None
         self.gm = self.client.game_state_manager
+        self.table_scraper = PokerTableScraper(self.driver, hero_name=hero_name)
+        self.event_detector = PokerEventDetector()
+        self.previous_table_state: PokerTableState | None = None
+        self.table_state: PokerTableState | None = None
+        self.table_events: list[PokerEvent] = []
 
     def start_gameplay_loop(self) -> None:
         self.client.navigate('https://network.pokernow.com/sng_tournaments')
@@ -74,10 +86,12 @@ class GameManager:
 
         self.wait_for_element_accepting_alerts(room_selector, timeout=900)
         element = self.element_helper.get_element(room_selector)
+        previous_windows = set(self.driver.window_handles)
         self.human_click(element, room_selector)
+        self.open_room_link_if_needed(room_selector, previous_windows)
 
-        time.sleep(1)
-        self.driver.switch_to.window(self.driver.window_handles[-1])
+        self.switch_to_new_table_window(previous_windows, timeout=15)
+        self.wait_for_table_loaded(timeout=300)
 
     def play_game(self) -> None:
         while True:
@@ -85,25 +99,43 @@ class GameManager:
             self.ignore_vc()
             self.accept_tos()
             self.im_back()
+            state = self.update_table_state()
+            if self.hero_left_table(state):
+                print("[state-event] Hero left table; ending play_game loop")
+                return
 
-            available_actions = self.client.action_helper.get_available_actions()
-            if available_actions:
-                if 'check' in available_actions:
-                    print("Detected turn from action buttons: check")
-                    self.human_click(available_actions['check'])
-                    continue
-                if 'fold' in available_actions:
-                    print("Detected turn from action buttons: fold")
-                    self.human_click(available_actions['fold'])
-                    continue
+    def update_table_state(self) -> PokerTableState:
+        current_state = self.table_scraper.scrape()
+        if self.table_state and self.table_state.starting_player_count is not None:
+            current_state.starting_player_count = self.table_state.starting_player_count
+        self.table_events = self.event_detector.detect(self.table_state, current_state)
+        self.previous_table_state = self.table_state
+        self.table_state = current_state
 
-            state = self.gm.get_game_state()
-            if state.is_your_turn:
-                available_actions = self.client.action_helper.get_available_actions()
-                if 'check' in available_actions:
-                    self.human_click(available_actions['check'])
-                elif 'fold' in available_actions:
-                    self.human_click(available_actions['fold'])
+        for event in self.table_events:
+            print(f"[state-event] {event.description}")
+
+        was_hero_turn = bool(self.previous_table_state and self.previous_table_state.is_hero_turn)
+        if current_state.is_hero_turn and not was_hero_turn:
+            print("[state-event] Hero turn started")
+            print(
+                "[state-event] Available actions: "
+                f"{', '.join(action.text for action in current_state.available_actions) or '-'}"
+            )
+
+        return current_state
+
+    def hero_left_table(self, current_state: PokerTableState) -> bool:
+        previous_hero = self.previous_table_state.hero if self.previous_table_state else None
+        current_hero = current_state.hero
+
+        if previous_hero is None:
+            return False
+
+        if current_hero is not None:
+            return False
+
+        return True
 
     def accept_tos(self) -> None:
         selector = "#accept-tos-button"  # accept tos
@@ -306,8 +338,8 @@ class GameManager:
 
         while time.monotonic() < deadline:
             try:
-                self.element_helper.wait_for_element(selector, timeout=1)
-                return
+                if self.element_helper.wait_for_element(selector, timeout=1):
+                    return
             except UnexpectedAlertPresentException as error:
                 last_error = error
                 self.accept_alert_if_present()
@@ -318,12 +350,73 @@ class GameManager:
             raise last_error
         raise TimeoutException(f"Timed out waiting for selector: {selector}")
 
+    def switch_to_new_table_window(self, previous_windows: set[str], timeout: int = 15) -> None:
+        deadline = time.monotonic() + timeout
+
+        while time.monotonic() < deadline:
+            current_windows = self.driver.window_handles
+            new_windows = [window for window in current_windows if window not in previous_windows]
+
+            if new_windows:
+                self.driver.switch_to.window(new_windows[-1])
+                return
+
+            if "/games/" in self.driver.current_url:
+                return
+
+            time.sleep(0.25)
+
+        self.driver.switch_to.window(self.driver.window_handles[-1])
+
+    def open_room_link_if_needed(self, selector: str, previous_windows: set[str]) -> None:
+        deadline = time.monotonic() + 5
+
+        while time.monotonic() < deadline:
+            if len(self.driver.window_handles) > len(previous_windows):
+                return
+            if "/games/" in self.driver.current_url:
+                return
+            time.sleep(0.25)
+
+        room_href = self.driver.execute_script(
+            """
+            const element = document.querySelector(arguments[0]);
+            return element ? element.href : null;
+            """,
+            selector,
+        )
+
+        if room_href:
+            self.driver.execute_script("window.open(arguments[0], '_blank');", room_href)
+
+    def wait_for_table_loaded(self, timeout: int = 60) -> None:
+        deadline = time.monotonic() + timeout
+        table_selectors = [
+            ".table-player",
+            ".table-game-type",
+            ".game-decisions-ctn",
+            ".table-cards",
+        ]
+
+        while time.monotonic() < deadline:
+            self.accept_alert_if_present()
+
+            if "/games/" in self.driver.current_url and any(
+                self.is_element_present_accepting_alerts(selector)
+                for selector in table_selectors
+            ):
+                return
+
+            time.sleep(1)
+
+        raise TimeoutException("Timed out waiting for the PokerNow table to load")
+
     def is_element_present_accepting_alerts(self, selector: str) -> bool:
         deadline = time.monotonic() + 3
 
         while time.monotonic() < deadline:
             try:
-                return self.element_helper.is_element_present(selector)
+                return bool(self.driver.find_elements(By.CSS_SELECTOR, selector))
             except UnexpectedAlertPresentException:
                 self.accept_alert_if_present()
 
