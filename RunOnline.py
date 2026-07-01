@@ -1,6 +1,8 @@
+import os
+
 from GameManager import GameManager
 
-game_manager = GameManager("bot_ >_<")
+game_manager = GameManager(os.getenv("POKERBOT_HERO_NAME"))
 
 try:
     game_manager.start_gameplay_loop()

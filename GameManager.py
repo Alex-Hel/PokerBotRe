@@ -10,6 +10,7 @@ import zipfile
 from selenium.common.exceptions import JavascriptException, NoAlertPresentException, StaleElementReferenceException, TimeoutException, UnexpectedAlertPresentException
 from selenium.webdriver.common.by import By
 
+from models.EquityModel import predict_state_equity
 from PokerState import PokerEvent, PokerEventDetector, PokerTableScraper, PokerTableState
 
 
@@ -79,13 +80,17 @@ class GameManager:
         while self.is_element_present_accepting_alerts(queue_selector):
             self.wait_for_recaptcha()
             self.wait_for_element_accepting_alerts(queue_selector, timeout=10)
-            element = self.element_helper.get_element(queue_selector)
+            element = self.get_element_accepting_alerts(queue_selector)
+            if element is None:
+                continue
             self.human_click(element, queue_selector)
             self.accept_alert_if_present()
             time.sleep(3)
 
         self.wait_for_element_accepting_alerts(room_selector, timeout=900)
-        element = self.element_helper.get_element(room_selector)
+        element = self.get_element_accepting_alerts(room_selector)
+        if element is None:
+            raise TimeoutException(f"Timed out waiting for selector: {room_selector}")
         previous_windows = set(self.driver.window_handles)
         self.human_click(element, room_selector)
         self.open_room_link_if_needed(room_selector, previous_windows)
@@ -100,14 +105,28 @@ class GameManager:
             self.accept_tos()
             self.im_back()
             state = self.update_table_state()
-            if self.hero_left_table(state):
+            was_hero_turn = bool(self.previous_table_state and self.previous_table_state.is_hero_turn)
+            if state.is_hero_turn and not was_hero_turn:
+                self.print_equity_estimates(state)
+            if self.hero_left_table(state) or len(state.players) == 1:
                 print("[state-event] Hero left table; ending play_game loop")
                 return
+
+    def print_equity_estimates(self, state: PokerTableState) -> None:
+        monte_carlo_equity = state.monte_carlo()
+        try:
+            keras_equity = predict_state_equity(state)
+            keras_text = f"{keras_equity:.3f}"
+        except Exception as exc:
+            keras_text = f"unavailable ({exc})"
+
+        print(f"equity: monte_carlo={monte_carlo_equity:.3f}, keras={keras_text}")
 
     def update_table_state(self) -> PokerTableState:
         current_state = self.table_scraper.scrape()
         if self.table_state and self.table_state.starting_player_count is not None:
             current_state.starting_player_count = self.table_state.starting_player_count
+        
         self.table_events = self.event_detector.detect(self.table_state, current_state)
         self.previous_table_state = self.table_state
         self.table_state = current_state
@@ -115,15 +134,20 @@ class GameManager:
         for event in self.table_events:
             print(f"[state-event] {event.description}")
 
-        was_hero_turn = bool(self.previous_table_state and self.previous_table_state.is_hero_turn)
-        if current_state.is_hero_turn and not was_hero_turn:
+        was_hero_turn = bool(self.previous_table_state and self.previous_table_state.was_hero_turn)
+        if current_state.was_hero_turn and not was_hero_turn:
             print("[state-event] Hero turn started")
             print(
                 "[state-event] Available actions: "
-                f"{', '.join(action.text for action in current_state.available_actions) or '-'}"
+                f"{', '.join(self.format_action(action) for action in current_state.available_actions) or '-'}"
             )
 
         return current_state
+
+    def format_action(self, action) -> str:
+        if action.amount_bb is not None:
+            return f"{action.name.title()} {action.amount_bb:.2f}bb"
+        return action.text
 
     def hero_left_table(self, current_state: PokerTableState) -> bool:
         previous_hero = self.previous_table_state.hero if self.previous_table_state else None
@@ -140,26 +164,41 @@ class GameManager:
     def accept_tos(self) -> None:
         selector = "#accept-tos-button"  # accept tos
         if self.is_element_present_accepting_alerts(selector):
-            element = self.element_helper.get_element(selector)
-            self.human_click(element, selector)
+            element = self.get_element_accepting_alerts(selector)
+            if element is not None:
+                self.human_click(element, selector)
 
     def im_back(self) -> None:
         selector = "button.button-1.action-button.green.highlighted.iamback"  # I am back!
         if self.is_element_present_accepting_alerts(selector):
-            element = self.element_helper.get_element(selector)
-            self.human_click(element, selector)
+            element = self.get_element_accepting_alerts(selector)
+            if element is not None:
+                self.human_click(element, selector)
 
     def ignore_vc(self) -> None:
         selector = "button.button-1.gray.highlighted" # ignore voice / video chat button
-        if self.is_element_present_accepting_alerts(selector):
-            element = self.element_helper.get_element(selector)
-            self.human_click(element, selector)
+        keywords = ("voice", "video", "audio", "camera", "microphone", "chat")
+        for element in self.driver.find_elements(By.CSS_SELECTOR, selector):
+            label = " ".join(
+                value.lower()
+                for value in (
+                    element.text,
+                    element.get_attribute("aria-label"),
+                    element.get_attribute("title"),
+                    element.get_attribute("class"),
+                )
+                if value
+            )
+            if any(keyword in label for keyword in keywords):
+                self.human_click(element)
+                return
 
     def leave_game(self) -> None:
         selector = "a.button-1.green.highlighted.med-button"  # leave game button
-        self.element_helper.wait_for_element(selector, timeout=10)
-        element = self.element_helper.get_element(selector)
-        self.human_click(element, selector)
+        self.wait_for_element_accepting_alerts(selector, timeout=10)
+        element = self.get_element_accepting_alerts(selector)
+        if element is not None:
+            self.human_click(element, selector)
 
     def human_click(self, element: WebElement, selector: str | None = None) -> None:
         if selector is not None:
@@ -338,17 +377,27 @@ class GameManager:
 
         while time.monotonic() < deadline:
             try:
-                if self.element_helper.wait_for_element(selector, timeout=1):
+                if self.driver.find_elements(By.CSS_SELECTOR, selector):
                     return
             except UnexpectedAlertPresentException as error:
                 last_error = error
                 self.accept_alert_if_present()
-            except TimeoutException as error:
-                last_error = error
 
         if last_error is not None:
             raise last_error
         raise TimeoutException(f"Timed out waiting for selector: {selector}")
+
+    def get_element_accepting_alerts(self, selector: str) -> WebElement | None:
+        deadline = time.monotonic() + 3
+
+        while time.monotonic() < deadline:
+            try:
+                elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                return elements[0] if elements else None
+            except UnexpectedAlertPresentException:
+                self.accept_alert_if_present()
+
+        return None
 
     def switch_to_new_table_window(self, previous_windows: set[str], timeout: int = 15) -> None:
         deadline = time.monotonic() + timeout

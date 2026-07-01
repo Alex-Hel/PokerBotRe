@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from itertools import combinations
+import random
 from time import time
 import re
 
 
 RANKS = ("2", "3", "4", "5", "6", "7", "8", "9", "T", "J", "Q", "K", "A")
 SUITS = ("c", "d", "h", "s")
+RANK_VALUES = {rank: index + 2 for index, rank in enumerate(RANKS)}
 
 
 @dataclass(frozen=True)
@@ -25,6 +28,7 @@ class PokerEvent:
     timestamp: float
     player_name: str | None = None
     amount: int | None = None
+    amount_bb: float | None = None
     description: str = ""
 
 
@@ -33,6 +37,7 @@ class ActionSnapshot:
     name: str
     text: str
     amount: int | None = None
+    amount_bb: float | None = None
     enabled: bool = True
 
 
@@ -41,15 +46,20 @@ class PlayerSnapshot:
     seat_index: int
     name: str
     stack: int | None = None
+    stack_bb: float | None = None
     bet: int | None = None
+    bet_bb: float | None = None
     status: str = "unknown"
     cards: list[Card] = field(default_factory=list)
     is_hero: bool = False
     is_current: bool = False
     is_dealer: bool = False
+    is_offline: bool = False
     has_turn_timer: bool = False
     time_bank_percent: float | None = None
     normal_time_percent: float | None = None
+    hole_card_class_combos: dict[str, int] = field(default_factory=dict)
+    hole_card_class_distribution: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -58,6 +68,7 @@ class PokerTableState:
     url: str
     game_type: str = ""
     pot: int | None = None
+    pot_bb: float | None = None
     blinds: list[int] = field(default_factory=list)
     starting_player_count: int | None = None
     community_cards: list[Card] = field(default_factory=list)
@@ -68,6 +79,7 @@ class PokerTableState:
     visible_actions: list[ActionSnapshot] = field(default_factory=list)
     available_actions: list[ActionSnapshot] = field(default_factory=list)
     remaining_deck: list[Card] = field(default_factory=list)
+    was_hero_turn: bool = False
 
     @property
     def hero(self) -> PlayerSnapshot | None:
@@ -75,8 +87,7 @@ class PokerTableState:
 
     @property
     def is_hero_turn(self) -> bool:
-        hero = self.hero
-        return bool(hero and hero.has_turn_timer and self.available_actions)
+        return self.was_hero_turn
 
     @property
     def enabled_actions(self) -> dict[str, ActionSnapshot]:
@@ -85,6 +96,191 @@ class PokerTableState:
             for action in self.available_actions
             if action.enabled
         }
+
+    @property
+    def active_opponents(self) -> list[PlayerSnapshot]:
+        return [
+            player
+            for player in self.players
+            if not player.is_hero and player.status != "folded"
+        ]
+
+    @property
+    def opponent_hole_card_class_distributions(self) -> dict[str, dict[str, float]]:
+        return {
+            player.name or f"seat_{player.seat_index}": player.hole_card_class_distribution
+            for player in self.players
+            if not player.is_hero
+        }
+
+    @property
+    def small_blind(self) -> int | None:
+        return self.blinds[0] if self.blinds else None
+
+    @property
+    def big_blind(self) -> int | None:
+        return self.blinds[-1] if self.blinds else None
+
+    def monte_carlo(
+        self,
+        simulations: int = 2000,
+        include_tie_equity: bool = True,
+        seed: int | None = None,
+    ) -> float:
+        if simulations <= 0 or len(self.hero_cards) < 2:
+            return 0.0
+
+        opponents = self.active_opponents
+        if not opponents:
+            return 1.0
+
+        rng = random.Random(seed)
+        hero_score_total = 0.0
+        completed_simulations = 0
+
+        for _ in range(simulations):
+            deck = list(self.remaining_deck)
+            rng.shuffle(deck)
+
+            board = list(self.community_cards)
+            opponent_hands = []
+
+            for opponent in opponents:
+                hand = list(opponent.cards)
+                while len(hand) < 2 and deck:
+                    hand.append(deck.pop())
+                if len(hand) < 2:
+                    break
+                opponent_hands.append(hand[:2])
+
+            if len(opponent_hands) != len(opponents):
+                continue
+
+            while len(board) < 5 and deck:
+                board.append(deck.pop())
+
+            if len(board) < 5:
+                continue
+
+            hero_score = best_holdem_score([*self.hero_cards[:2], *board])
+            opponent_scores = [
+                best_holdem_score([*hand, *board])
+                for hand in opponent_hands
+            ]
+            best_opponent_score = max(opponent_scores)
+
+            completed_simulations += 1
+            if hero_score > best_opponent_score:
+                hero_score_total += 1.0
+            elif include_tie_equity and hero_score == best_opponent_score:
+                tied_opponents = sum(1 for score in opponent_scores if score == hero_score)
+                hero_score_total += 1.0 / (tied_opponents + 1)
+
+        if completed_simulations == 0:
+            return 0.0
+
+        return hero_score_total / completed_simulations
+
+
+def best_holdem_score(cards: list[Card]) -> tuple:
+    return max(evaluate_five_card_hand(list(hand)) for hand in combinations(cards, 5))
+
+
+def evaluate_five_card_hand(cards: list[Card]) -> tuple:
+    values = sorted((RANK_VALUES[card.rank] for card in cards), reverse=True)
+    suits = [card.suit for card in cards]
+    counts = {value: values.count(value) for value in set(values)}
+    count_groups = sorted(counts.items(), key=lambda item: (item[1], item[0]), reverse=True)
+
+    is_flush = len(set(suits)) == 1
+    straight_high = get_straight_high(values)
+
+    if is_flush and straight_high:
+        return 8, straight_high
+
+    if count_groups[0][1] == 4:
+        quad = count_groups[0][0]
+        kicker = max(value for value in values if value != quad)
+        return 7, quad, kicker
+
+    if count_groups[0][1] == 3 and count_groups[1][1] == 2:
+        return 6, count_groups[0][0], count_groups[1][0]
+
+    if is_flush:
+        return 5, *values
+
+    if straight_high:
+        return 4, straight_high
+
+    if count_groups[0][1] == 3:
+        trips = count_groups[0][0]
+        kickers = sorted((value for value in values if value != trips), reverse=True)
+        return 3, trips, *kickers
+
+    pairs = [value for value, count in count_groups if count == 2]
+    if len(pairs) == 2:
+        high_pair, low_pair = sorted(pairs, reverse=True)
+        kicker = max(value for value in values if value not in pairs)
+        return 2, high_pair, low_pair, kicker
+
+    if len(pairs) == 1:
+        pair = pairs[0]
+        kickers = sorted((value for value in values if value != pair), reverse=True)
+        return 1, pair, *kickers
+
+    return 0, *values
+
+
+def get_straight_high(values: list[int]) -> int | None:
+    unique_values = sorted(set(values), reverse=True)
+    if 14 in unique_values:
+        unique_values.append(1)
+
+    for index in range(len(unique_values) - 4):
+        window = unique_values[index:index + 5]
+        if window[0] - window[4] == 4:
+            return window[0]
+
+    return None
+
+
+def hole_card_class(cards: list[Card]) -> str | None:
+    if len(cards) < 2:
+        return None
+
+    first, second = cards[:2]
+    ranks = sorted((first.rank, second.rank), key=lambda rank: RANK_VALUES[rank], reverse=True)
+    if ranks[0] == ranks[1]:
+        return f"{ranks[0]}{ranks[1]}"
+
+    suited_marker = "s" if first.suit == second.suit else "o"
+    return f"{ranks[0]}{ranks[1]}{suited_marker}"
+
+
+def hole_card_class_combos(cards: list[Card]) -> dict[str, int]:
+    combos: dict[str, int] = {}
+    for first, second in combinations(cards, 2):
+        hand_class = hole_card_class([first, second])
+        if hand_class is not None:
+            combos[hand_class] = combos.get(hand_class, 0) + 1
+
+    return dict(sorted(combos.items(), key=lambda item: hole_card_class_sort_key(item[0])))
+
+
+def hole_card_class_distribution(cards: list[Card]) -> dict[str, float]:
+    combos = hole_card_class_combos(cards)
+    total = sum(combos.values())
+    if total == 0:
+        return {}
+    return {hand_class: count / total for hand_class, count in combos.items()}
+
+
+def hole_card_class_sort_key(hand_class: str) -> tuple:
+    high = RANK_VALUES.get(hand_class[0], 0)
+    low = RANK_VALUES.get(hand_class[1], high)
+    pair_first = 0 if len(hand_class) == 2 else 1
+    suited_first = 0 if hand_class.endswith("s") else 1
+    return pair_first, -high, -low, suited_first
 
 
 class PokerTableScraper:
@@ -133,10 +329,11 @@ class PokerTableScraper:
                 timeBankPercent: percent(player, '.time-to-talk .time-bank'),
                 normalTimePercent: percent(player, '.time-to-talk .normal-time'),
                 isHero: player.matches('.you-player'),
-                isCurrent: player.matches('.decision-current'),
-                isDealer: Boolean(player.querySelector('.dealer-button-ctn')),
-                cards: [...player.querySelectorAll('.table-player-cards .card-container.flipped')].map(cardRaw),
-            }));
+            isCurrent: player.matches('.decision-current'),
+            isDealer: Boolean(player.querySelector('.dealer-button-ctn')),
+            isOffline: player.matches('.offline'),
+            cards: [...player.querySelectorAll('.table-player-cards .card-container.flipped')].map(cardRaw),
+        }));
 
             const heroPlayer = document.querySelector('.table-player.you-player');
             const isHeroTurn = Boolean(heroPlayer?.matches('.decision-current') && heroPlayer.querySelector('.time-to-talk'));
@@ -145,7 +342,8 @@ class PokerTableScraper:
                 url: window.location.href,
                 gameType: text(document, '.table-game-type'),
                 pot: text(document, '.table-pot-size .main-value'),
-                blinds: [...document.querySelectorAll('.blind-value-ctn .chips-value')]
+                isHeroTurn,
+                blinds: [...document.querySelectorAll('.blind-value-ctn .chips-value, .blind-value .chips-value')]
                     .map((element) => (element.innerText || '').trim()),
                 communityCards: [...document.querySelectorAll('.table-cards .card-container.flipped')]
                     .map(cardRaw),
@@ -157,31 +355,37 @@ class PokerTableScraper:
             """
         )
 
+        blinds = [
+            blind for blind in (self._parse_int(value) for value in data.get("blinds", []))
+            if blind is not None
+        ]
+        big_blind = blinds[-1] if blinds else None
+        pot = self._parse_int(data.get("pot"))
         players = [
-            self._build_player(raw_player)
+            self._build_player(raw_player, big_blind)
             for raw_player in data.get("players", [])
         ]
         parsed_actions = [
-            action for action in (self._parse_action(value) for value in data.get("actions", []))
+            action for action in (self._parse_action(value, big_blind) for value in data.get("actions", []))
             if action is not None
         ]
+        available_actions = [action for action in parsed_actions if action.enabled]
         known_cards = [
             *self._parse_cards(data.get("communityCards", [])),
             *(card for player in players for card in player.cards),
         ]
         remaining_deck = self._remaining_deck(known_cards)
         hero_cards = next((player.cards for player in players if player.is_hero), [])
+        self._set_hole_card_class_distributions(players, remaining_deck)
         starting_player_count = len(players) if players else None
 
         return PokerTableState(
             timestamp=time(),
             url=data.get("url", ""),
             game_type=data.get("gameType", ""),
-            pot=self._parse_int(data.get("pot")),
-            blinds=[
-                blind for blind in (self._parse_int(value) for value in data.get("blinds", []))
-                if blind is not None
-            ],
+            pot=pot,
+            pot_bb=self._to_big_blinds(pot, big_blind),
+            blinds=blinds,
             starting_player_count=starting_player_count,
             community_cards=self._parse_cards(data.get("communityCards", [])),
             hero_cards=hero_cards,
@@ -189,26 +393,60 @@ class PokerTableScraper:
             current_player_name=next((player.name for player in players if player.is_current), None),
             dealer_seat_index=next((player.seat_index for player in players if player.is_dealer), None),
             visible_actions=parsed_actions,
-            available_actions=[action for action in parsed_actions if action.enabled],
+            available_actions=available_actions,
             remaining_deck=remaining_deck,
+            was_hero_turn=bool(data.get("isHeroTurn")),
         )
 
-    def _build_player(self, raw_player: dict) -> PlayerSnapshot:
+    def _build_player(self, raw_player: dict, big_blind: int | None = None) -> PlayerSnapshot:
         name = raw_player.get("name", "")
+        stack = self._parse_int(raw_player.get("stack"))
+        bet = self._parse_int(raw_player.get("bet"))
         return PlayerSnapshot(
             seat_index=int(raw_player.get("seatIndex", 0)),
             name=name,
-            stack=self._parse_int(raw_player.get("stack")),
-            bet=self._parse_int(raw_player.get("bet")),
+            stack=stack,
+            stack_bb=self._to_big_blinds(stack, big_blind),
+            bet=bet,
+            bet_bb=self._to_big_blinds(bet, big_blind),
             status=self._parse_status(raw_player),
             cards=self._parse_cards(raw_player.get("cards", [])),
             is_hero=bool(raw_player.get("isHero")) or bool(self.hero_name and name == self.hero_name),
             is_current=bool(raw_player.get("isCurrent")),
             is_dealer=bool(raw_player.get("isDealer")),
+            is_offline=bool(raw_player.get("isOffline")) or "offline" in str(raw_player.get("statusText", "")).lower(),
             has_turn_timer=bool(raw_player.get("hasTurnTimer")),
             time_bank_percent=raw_player.get("timeBankPercent"),
             normal_time_percent=raw_player.get("normalTimePercent"),
         )
+
+    def _set_hole_card_class_distributions(
+        self,
+        players: list[PlayerSnapshot],
+        remaining_deck: list[Card],
+    ) -> None:
+        unknown_combos = hole_card_class_combos(remaining_deck)
+        unknown_total = sum(unknown_combos.values())
+        unknown_distribution = (
+            {hand_class: count / unknown_total for hand_class, count in unknown_combos.items()}
+            if unknown_total
+            else {}
+        )
+
+        for player in players:
+            known_class = hole_card_class(player.cards)
+            if known_class is not None:
+                player.hole_card_class_combos = {known_class: 1}
+                player.hole_card_class_distribution = {known_class: 1.0}
+                continue
+
+            if player.is_hero:
+                player.hole_card_class_combos = {}
+                player.hole_card_class_distribution = {}
+                continue
+
+            player.hole_card_class_combos = dict(unknown_combos)
+            player.hole_card_class_distribution = dict(unknown_distribution)
 
     def _parse_cards(self, raw_cards: list[dict]) -> list[Card]:
         cards = []
@@ -274,7 +512,12 @@ class PokerTableScraper:
         digits = re.sub(r"[^\d-]", "", str(value))
         return int(digits) if digits else None
 
-    def _parse_action(self, raw_action: dict) -> ActionSnapshot | None:
+    def _to_big_blinds(self, amount: int | None, big_blind: int | None) -> float | None:
+        if amount is None or not big_blind:
+            return None
+        return amount / big_blind
+
+    def _parse_action(self, raw_action: dict, big_blind: int | None = None) -> ActionSnapshot | None:
         text = str(raw_action.get("text", "")).strip()
         if not text:
             return None
@@ -287,10 +530,12 @@ class PokerTableScraper:
         if action_name is None:
             return None
 
+        amount = self._parse_int(text)
         return ActionSnapshot(
             name=action_name,
             text=text,
-            amount=self._parse_int(text),
+            amount=amount,
+            amount_bb=self._to_big_blinds(amount, big_blind),
             enabled=not bool(raw_action.get("disabled")),
         )
 
@@ -298,6 +543,8 @@ class PokerTableScraper:
         class_name = raw_player.get("className", "").lower()
         status_text = raw_player.get("statusText", "").strip().lower()
 
+        if "offline" in class_name or "offline" in status_text:
+            return "offline"
         if "fold" in class_name or "fold" in status_text:
             return "folded"
         if "all-in" in class_name or "all in" in status_text or "all-in" in status_text:
@@ -323,11 +570,28 @@ class PokerEventDetector:
             ]
 
         events = []
+        events.extend(self._detect_blind_events(previous, current))
         events.extend(self._detect_board_events(previous, current))
         events.extend(self._detect_turn_events(previous, current))
         events.extend(self._detect_action_button_events(previous, current))
         events.extend(self._detect_player_events(previous, current))
         return events
+
+    def _detect_blind_events(self, previous: PokerTableState, current: PokerTableState) -> list[PokerEvent]:
+        if previous.blinds == current.blinds:
+            return []
+
+        previous_blinds = "/".join(str(blind) for blind in previous.blinds) or "-"
+        current_blinds = "/".join(str(blind) for blind in current.blinds) or "-"
+        return [
+            PokerEvent(
+                event_type="blinds_changed",
+                timestamp=current.timestamp,
+                amount=current.big_blind,
+                amount_bb=1.0 if current.big_blind else None,
+                description=f"Blinds changed from {previous_blinds} to {current_blinds}",
+            )
+        ]
 
     def _detect_board_events(self, previous: PokerTableState, current: PokerTableState) -> list[PokerEvent]:
         previous_board = [str(card) for card in previous.community_cards]
@@ -436,6 +700,26 @@ class PokerEventDetector:
                 )
             )
 
+        if not previous.is_offline and current.is_offline:
+            events.append(
+                PokerEvent(
+                    event_type="player_went_offline",
+                    timestamp=timestamp,
+                    player_name=current.name,
+                    description=f"{current.name} went offline",
+                )
+            )
+
+        if previous.is_offline and not current.is_offline:
+            events.append(
+                PokerEvent(
+                    event_type="player_came_online",
+                    timestamp=timestamp,
+                    player_name=current.name,
+                    description=f"{current.name} came back online",
+                )
+            )
+
         previous_bet = previous.bet or 0
         current_bet = current.bet or 0
         if current_bet > previous_bet:
@@ -451,7 +735,11 @@ class PokerEventDetector:
                     timestamp=timestamp,
                     player_name=current.name,
                     amount=current_bet,
-                    description=f"{current.name} {event_type.removeprefix('player_').replace('_', ' ')} to {current_bet}",
+                    amount_bb=current.bet_bb,
+                    description=(
+                        f"{current.name} {event_type.removeprefix('player_').replace('_', ' ')} "
+                        f"to {self._format_amount(current_bet, current.bet_bb)}"
+                    ),
                 )
             )
 
@@ -462,28 +750,20 @@ class PokerEventDetector:
                     timestamp=timestamp,
                     player_name=current.name,
                     amount=current.stack,
-                    description=f"{current.name} stack changed from {previous.stack} to {current.stack}",
-                )
-            )
-
-        if not previous.has_turn_timer and current.has_turn_timer:
-            events.append(
-                PokerEvent(
-                    event_type="player_timer_started",
-                    timestamp=timestamp,
-                    player_name=current.name,
-                    description=f"{current.name}'s timer started",
-                )
-            )
-
-        if previous.has_turn_timer and not current.has_turn_timer:
-            events.append(
-                PokerEvent(
-                    event_type="player_timer_stopped",
-                    timestamp=timestamp,
-                    player_name=current.name,
-                    description=f"{current.name}'s timer stopped",
+                    amount_bb=current.stack_bb,
+                    description=(
+                        f"{current.name} stack changed from "
+                        f"{self._format_amount(previous.stack, previous.stack_bb)} to "
+                        f"{self._format_amount(current.stack, current.stack_bb)}"
+                    ),
                 )
             )
 
         return events
+
+    def _format_amount(self, amount: int | None, amount_bb: float | None) -> str:
+        if amount_bb is not None:
+            return f"{amount_bb:.2f}bb"
+        if amount is not None:
+            return str(amount)
+        return "-"
