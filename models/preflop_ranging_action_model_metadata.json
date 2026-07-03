@@ -1,0 +1,83 @@
+{
+  "model_path": "C:\\Users\\Helto\\OneDrive\\Documents\\PokerBotRe\\models\\preflop_ranging_action_model.cbm",
+  "input_files": [
+    "C:\\Users\\Helto\\OneDrive\\Documents\\PokerBotRe\\data\\interpreted\\ranging_rows.csv"
+  ],
+  "feature_names": [
+    "facing_amount_bb",
+    "stack_bb",
+    "facing_amount_stack_fraction",
+    "card_bucket",
+    "suitedness",
+    "keras_equity",
+    "seat_bucket",
+    "call_ev",
+    "paired",
+    "pot_bb",
+    "players_left_fraction",
+    "players_in_hand_fraction",
+    "previous_raises_in_hand",
+    "previous_raises_by_self_in_hand",
+    "stack_to_pot_ratio",
+    "amount_put_in_pot_bb",
+    "amount_put_in_pot_stack_fraction",
+    "can_check"
+  ],
+  "categorical_features": [
+    "card_bucket",
+    "suitedness",
+    "seat_bucket"
+  ],
+  "categorical_feature_indices": [
+    3,
+    4,
+    6
+  ],
+  "excluded_features": [
+    "street",
+    "stack_rank_fraction",
+    "pot_stack_fraction",
+    "last_aggressor_is_self",
+    "board_max_rank_count",
+    "board_two_pair_or_better",
+    "personal_flush_fraction",
+    "board_flush_fraction",
+    "personal_straight_fraction",
+    "board_straight_fraction",
+    "has_highest_pair"
+  ],
+  "action_buckets": [
+    "fold",
+    "check",
+    "call",
+    "min_raise",
+    "half_pot_raise",
+    "three_quarter_pot_raise",
+    "pot_raise",
+    "all_in"
+  ],
+  "label_counts": {
+    "call": 10562,
+    "fold": 40404,
+    "pot_raise": 12992,
+    "all_in": 1418,
+    "check": 1088,
+    "half_pot_raise": 95,
+    "three_quarter_pot_raise": 236,
+    "min_raise": 43
+  },
+  "train_count": 63497,
+  "test_count": 3341,
+  "iterations": 2000,
+  "depth": 5,
+  "learning_rate": 0.02,
+  "l2_leaf_reg": 3.0,
+  "random_strength": 0.75,
+  "bagging_temperature": 1.0,
+  "rsm": 1.0,
+  "od_wait": 100,
+  "balanced": false,
+  "model_scope": "preflop",
+  "street_filter": "preflop",
+  "seed": 42
+}

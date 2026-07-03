@@ -24,7 +24,7 @@ Raw hand-history data goes in `data/raw`. Convert it into ranging-model CSV rows
 .\.venv\Scripts\python.exe InterpretTrainingData.py
 ```
 
-Outputs are written to `data/interpreted`. By default `keras_equity` is computed. For a faster debug conversion that leaves it as `nan`, run:
+Outputs are written to `data/interpreted`, including combined `ranging_rows.csv` plus preflop/postflop split CSVs. By default `keras_equity` is computed. For a faster debug conversion that leaves it as `nan`, run:
 
 ```powershell
 .\.venv\Scripts\python.exe InterpretTrainingData.py --skip-keras-equity
@@ -38,29 +38,41 @@ Keras equity is predicted in batches. You can tune the batch size with:
 
 ## Ranging Model Training
 
-Train the CatBoost action-probability model from interpreted CSV rows:
+Train separate CatBoost action-probability models for preflop and postflop:
 
 ```powershell
-.\.venv\Scripts\python.exe TrainRangingModel.py
+.\.venv\Scripts\python.exe TrainPreflopRangingModel.py
+.\.venv\Scripts\python.exe TrainPostflopRangingModel.py
 ```
 
-Outputs are written to `models/ranging_action_model.cbm` and `models/ranging_action_model_metadata.json`.
-By default, direct hole-card identity/strength features are excluded to reduce overfitting. To train a hole-card-aware model, add:
+Outputs are written to:
+
+```text
+models/preflop_ranging_action_model.cbm
+models/preflop_ranging_action_model_metadata.json
+models/postflop_ranging_action_model.cbm
+models/postflop_ranging_action_model_metadata.json
+```
+
+The shared trainer can also be called directly:
 
 ```powershell
-.\.venv\Scripts\python.exe TrainRangingModel.py --include-hole-card-features
+.\.venv\Scripts\python.exe TrainRangingModel.py --model-scope preflop
+.\.venv\Scripts\python.exe TrainRangingModel.py --model-scope postflop
 ```
 
 For a quick smoke test:
 
 ```powershell
-.\.venv\Scripts\python.exe TrainRangingModel.py --max-rows 5000 --iterations 50
+.\.venv\Scripts\python.exe TrainPreflopRangingModel.py --max-rows 5000 --iterations 50
+.\.venv\Scripts\python.exe TrainPostflopRangingModel.py --max-rows 5000 --iterations 50
 ```
 
 For class-balanced training:
 
 ```powershell
-.\.venv\Scripts\python.exe TrainRangingModel.py --balanced
+.\.venv\Scripts\python.exe TrainPreflopRangingModel.py --balanced
+.\.venv\Scripts\python.exe TrainPostflopRangingModel.py --balanced
 ```
 
 ## CatBoost Simulator

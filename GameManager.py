@@ -11,6 +11,7 @@ from selenium.common.exceptions import JavascriptException, NoAlertPresentExcept
 from selenium.webdriver.common.by import By
 
 from models.EquityModel import predict_state_equity
+from models.RangingModel import LiveRangingTracker, average_combo_range_equity
 from PokerState import PokerEvent, PokerEventDetector, PokerTableScraper, PokerTableState
 
 
@@ -27,6 +28,9 @@ class GameManager:
     table_events = None
 
     def __init__(self, hero_name: str | None = None) -> None:
+        self.cookie_path = Path(__file__).resolve().with_name('cookie_file.pkl')
+        self.had_saved_cookies = self.cookie_path.is_file()
+
         options = webdriver.ChromeOptions()
         options.add_argument('--no-sandbox')
         options.add_argument('--disable-dev-shm-usage')
@@ -44,24 +48,28 @@ class GameManager:
         options.add_argument('--load-extension=chromium')
 
         self.driver = webdriver.Chrome(options=options, version_main=149)
-        self.client = PokerClient(self.driver, cookie_path='cookie_file.pkl')
+        self.client = PokerClient(self.driver, cookie_path=str(self.cookie_path))
         self.element_helper = ElementHelper(self.driver)
         self.mouse_x = None
         self.mouse_y = None
         self.gm = self.client.game_state_manager
         self.table_scraper = PokerTableScraper(self.driver, hero_name=hero_name)
         self.event_detector = PokerEventDetector()
+        self.ranging_tracker = LiveRangingTracker()
         self.previous_table_state: PokerTableState | None = None
         self.table_state: PokerTableState | None = None
         self.table_events: list[PokerEvent] = []
+        self.last_equity_overlay: dict[str, str] | None = None
+        self.last_opponent_equity_by_seat: dict[str, str] = {}
 
     def start_gameplay_loop(self) -> None:
         self.client.navigate('https://network.pokernow.com/sng_tournaments')
+        self.driver.maximize_window()
 
-        file_path = Path('cookie_file.pkl') #get login cookies / info
-        if not file_path.is_file():
-            input('enter login, press enter when done')
+        if not self.had_saved_cookies:
+            input(f'enter login, press enter when done ({self.cookie_path})')
             self.client.cookie_manager.save_cookies()
+            self.had_saved_cookies = True
 
         while True:
             self.join_game()
@@ -107,12 +115,37 @@ class GameManager:
             state = self.update_table_state()
             was_hero_turn = bool(self.previous_table_state and self.previous_table_state.is_hero_turn)
             if state.is_hero_turn and not was_hero_turn:
-                self.print_equity_estimates(state)
+                sampling_estimates = self.sampling_equity_estimates(state)
+                self.update_equity_overlay(state, estimates=sampling_estimates)
+                estimates = self.calculate_equity_estimates(state)
+                self.print_equity_estimates(estimates)
+                self.update_equity_overlay(
+                    state,
+                    estimates=estimates,
+                    refresh_opponent_equities=True,
+                )
+            else:
+                self.update_equity_overlay(state)
             if self.hero_left_table(state) or len(state.players) == 1:
                 print("[state-event] Hero left table; ending play_game loop")
                 return
 
-    def print_equity_estimates(self, state: PokerTableState) -> None:
+    def print_equity_estimates(self, estimates: dict[str, str]) -> None:
+        print(
+            "equity: "
+            f"ranged={estimates['ranged_equity']}, "
+            f"keras={estimates['keras_equity']}"
+        )
+
+    def sampling_equity_estimates(self, state: PokerTableState) -> dict[str, str]:
+        return {
+            "ranged_equity": "sampling...",
+            "keras_equity": "sampling...",
+            "cards": self.format_cards(state),
+            "updated": time.strftime("%H:%M:%S"),
+        }
+
+    def calculate_equity_estimates(self, state: PokerTableState) -> dict[str, str]:
         monte_carlo_equity = state.monte_carlo()
         try:
             keras_equity = predict_state_equity(state)
@@ -120,19 +153,265 @@ class GameManager:
         except Exception as exc:
             keras_text = f"unavailable ({exc})"
 
-        print(f"equity: monte_carlo={monte_carlo_equity:.3f}, keras={keras_text}")
+        return {
+            "ranged_equity": f"{monte_carlo_equity:.3f}",
+            "keras_equity": keras_text,
+            "cards": self.format_cards(state),
+            "updated": time.strftime("%H:%M:%S"),
+        }
+
+    def update_equity_overlay(
+        self,
+        state: PokerTableState,
+        estimates: dict[str, str] | None = None,
+        refresh_opponent_equities: bool = False,
+    ) -> None:
+        if estimates is not None:
+            self.last_equity_overlay = estimates
+
+        if refresh_opponent_equities:
+            self.last_opponent_equity_by_seat = self.opponent_equity_by_seat(state)
+
+        overlay = self.last_equity_overlay or {
+            "ranged_equity": "-",
+            "keras_equity": "-",
+            "cards": self.format_cards(state),
+            "updated": "waiting for turn",
+        }
+        self.inject_equity_overlay(overlay, self.opponent_equity_overlays(state))
+
+    def opponent_equity_by_seat(self, state: PokerTableState) -> dict[str, str]:
+        equities = {}
+        for player in state.players:
+            if player.is_hero or player.status in {"folded", "offline"}:
+                continue
+
+            mean_equity = average_combo_range_equity(player.hole_combo_range, state)
+            equities[str(player.seat_index)] = f"{mean_equity:.3f}" if mean_equity is not None else "-"
+        return equities
+
+    def opponent_equity_overlays(self, state: PokerTableState) -> list[dict[str, str]]:
+        overlays = []
+        for player in state.players:
+            if player.is_hero or player.status in {"folded", "offline"}:
+                continue
+
+            seat_index = str(player.seat_index)
+            overlays.append({
+                "seat_index": seat_index,
+                "mean_equity": self.last_opponent_equity_by_seat.get(seat_index, "-"),
+            })
+        return overlays
+
+    def reset_equity_overlays(self) -> None:
+        self.last_equity_overlay = None
+        self.last_opponent_equity_by_seat = {}
+
+    def should_reset_equity_overlays(
+        self,
+        previous: PokerTableState | None,
+        current: PokerTableState,
+    ) -> bool:
+        if previous is None:
+            return True
+
+        previous_hero_cards = tuple(str(card) for card in previous.hero_cards)
+        current_hero_cards = tuple(str(card) for card in current.hero_cards)
+        if previous_hero_cards and not current_hero_cards:
+            return True
+        if previous_hero_cards and current_hero_cards and previous_hero_cards != current_hero_cards:
+            return True
+        if len(current.community_cards) < len(previous.community_cards):
+            return True
+        return False
+
+    def inject_equity_overlay(
+        self,
+        overlay: dict[str, str],
+        opponent_overlays: list[dict[str, str]],
+    ) -> None:
+        try:
+            self.driver.execute_script(
+                """
+                const data = arguments[0];
+                const opponentData = arguments[1] || [];
+                const id = 'pokerbot-equity-overlay';
+                let root = document.getElementById(id);
+                if (!root) {
+                    root = document.createElement('div');
+                    root.id = id;
+                    document.body.appendChild(root);
+                }
+
+                root.innerHTML = '';
+                Object.assign(root.style, {
+                    position: 'fixed',
+                    top: '50%',
+                    bottom: 'auto',
+                    left: '50%',
+                    transform: 'translate(-50%, -50%)',
+                    zIndex: '2147483647',
+                    minWidth: '180px',
+                    padding: '10px 12px',
+                    borderRadius: '8px',
+                    border: '1px solid rgba(255,255,255,0.22)',
+                    background: 'rgba(8, 12, 18, 0.88)',
+                    color: '#f8fafc',
+                    fontFamily: 'Arial, sans-serif',
+                    fontSize: '13px',
+                    lineHeight: '1.35',
+                    boxShadow: '0 8px 24px rgba(0,0,0,0.35)',
+                    pointerEvents: 'none',
+                    textAlign: 'left'
+                });
+
+                const addRow = (label, value) => {
+                    const row = document.createElement('div');
+                    Object.assign(row.style, {
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        gap: '12px',
+                        whiteSpace: 'nowrap'
+                    });
+
+                    const key = document.createElement('span');
+                    key.textContent = label;
+                    key.style.color = '#cbd5e1';
+
+                    const val = document.createElement('span');
+                    val.textContent = value;
+                    val.style.fontWeight = '700';
+
+                    row.appendChild(key);
+                    row.appendChild(val);
+                    root.appendChild(row);
+                };
+
+                addRow('Ranged equity', data.ranged_equity || '-');
+                addRow('Keras equity', data.keras_equity || '-');
+
+                const meta = document.createElement('div');
+                meta.textContent = `${data.cards || ''} ${data.updated || ''}`.trim();
+                Object.assign(meta.style, {
+                    marginTop: '6px',
+                    color: '#94a3b8',
+                    fontSize: '11px'
+                });
+                root.appendChild(meta);
+
+                const clampHudPosition = (targetLeft, targetTop) => {
+                    const margin = 12;
+                    const halfWidth = root.offsetWidth / 2;
+                    const clampedLeft = Math.min(
+                        window.innerWidth - halfWidth - margin,
+                        Math.max(halfWidth + margin, targetLeft)
+                    );
+                    const clampedTop = Math.min(
+                        window.innerHeight - root.offsetHeight - margin,
+                        Math.max(margin, targetTop)
+                    );
+                    root.style.left = `${clampedLeft}px`;
+                    root.style.right = 'auto';
+                    root.style.bottom = 'auto';
+                    root.style.top = `${clampedTop}px`;
+                    root.style.transform = 'translateX(-50%)';
+                };
+
+                const board = document.querySelector('.table-cards');
+                const boardHasCards = Boolean(board?.querySelector('.card-container.flipped'));
+                if (board && board.offsetParent !== null && boardHasCards) {
+                    const rect = board.getBoundingClientRect();
+                    clampHudPosition(
+                        rect.left + rect.width / 2,
+                        rect.bottom + 10
+                    );
+                } else {
+                    root.style.left = '50%';
+                    root.style.right = 'auto';
+                    root.style.bottom = 'auto';
+                    root.style.top = '50%';
+                    root.style.transform = 'translate(-50%, -50%)';
+                }
+
+                const existingOpponentOverlays = [
+                    ...document.querySelectorAll('.pokerbot-opponent-equity-overlay')
+                ];
+                for (const node of existingOpponentOverlays) {
+                    node.remove();
+                }
+
+                const players = [...document.querySelectorAll('.table-player')];
+                for (const item of opponentData) {
+                    const player = players[Number(item.seat_index)];
+                    if (!player) {
+                        continue;
+                    }
+
+                    const badge = document.createElement('div');
+                    badge.className = 'pokerbot-opponent-equity-overlay';
+                    badge.textContent = `Mean equity ${item.mean_equity || '-'}`;
+                    Object.assign(badge.style, {
+                        position: 'absolute',
+                        left: '50%',
+                        top: 'calc(100% + 6px)',
+                        transform: 'translateX(-50%)',
+                        zIndex: '2147483647',
+                        padding: '4px 7px',
+                        borderRadius: '6px',
+                        background: 'rgba(8, 12, 18, 0.86)',
+                        border: '1px solid rgba(255,255,255,0.2)',
+                        color: '#f8fafc',
+                        fontFamily: 'Arial, sans-serif',
+                        fontSize: '11px',
+                        fontWeight: '700',
+                        lineHeight: '1.2',
+                        whiteSpace: 'nowrap',
+                        pointerEvents: 'none',
+                        boxShadow: '0 4px 14px rgba(0,0,0,0.28)'
+                    });
+
+                    if (getComputedStyle(player).position === 'static') {
+                        player.style.position = 'relative';
+                    }
+                    player.appendChild(badge);
+                }
+                """,
+                overlay,
+                opponent_overlays,
+            )
+        except JavascriptException:
+            return
+
+    def format_cards(self, state: PokerTableState) -> str:
+        hero_cards = " ".join(str(card) for card in state.hero_cards) or "--"
+        board_cards = " ".join(str(card) for card in state.community_cards) or "--"
+        return f"{hero_cards} | {board_cards}"
 
     def update_table_state(self) -> PokerTableState:
         current_state = self.table_scraper.scrape()
         if self.table_state and self.table_state.starting_player_count is not None:
             current_state.starting_player_count = self.table_state.starting_player_count
+
+        if self.should_reset_equity_overlays(self.table_state, current_state):
+            self.reset_equity_overlays()
         
         self.table_events = self.event_detector.detect(self.table_state, current_state)
+        self.ranging_tracker.process_snapshot(self.table_state, current_state, self.table_events)
         self.previous_table_state = self.table_state
         self.table_state = current_state
 
         for event in self.table_events:
             print(f"[state-event] {event.description}")
+        for update in self.ranging_tracker.last_updates:
+            equity_text = (
+                f"{update.average_equity:.3f}"
+                if update.average_equity is not None
+                else "unavailable"
+            )
+            print(
+                f"[range] {update.player_name} {update.action_bucket}: "
+                f"avg_equity={equity_text}, combos={update.combo_count}"
+            )
 
         was_hero_turn = bool(self.previous_table_state and self.previous_table_state.was_hero_turn)
         if current_state.was_hero_turn and not was_hero_turn:
@@ -407,6 +686,7 @@ class GameManager:
             new_windows = [window for window in current_windows if window not in previous_windows]
 
             if new_windows:
+                self.driver.close()
                 self.driver.switch_to.window(new_windows[-1])
                 return
 

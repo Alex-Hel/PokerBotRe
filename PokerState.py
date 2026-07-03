@@ -60,6 +60,8 @@ class PlayerSnapshot:
     normal_time_percent: float | None = None
     hole_card_class_combos: dict[str, int] = field(default_factory=dict)
     hole_card_class_distribution: dict[str, float] = field(default_factory=dict)
+    hole_combo_range: dict[tuple[Card, Card], float] = field(default_factory=dict)
+    hole_card_distribution: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -123,7 +125,7 @@ class PokerTableState:
 
     def monte_carlo(
         self,
-        simulations: int = 2000,
+        simulations: int = 250,
         include_tie_equity: bool = True,
         seed: int | None = None,
     ) -> float:
@@ -147,8 +149,17 @@ class PokerTableState:
 
             for opponent in opponents:
                 hand = list(opponent.cards)
-                while len(hand) < 2 and deck:
-                    hand.append(deck.pop())
+                if len(hand) >= 2:
+                    hand = hand[:2]
+                    _remove_cards_from_deck(deck, hand)
+                else:
+                    sampled = _sample_combo_from_range(opponent.hole_combo_range, deck, rng)
+                    if sampled is not None:
+                        hand = list(sampled)
+                        _remove_cards_from_deck(deck, hand)
+                    else:
+                        while len(hand) < 2 and deck:
+                            hand.append(deck.pop())
                 if len(hand) < 2:
                     break
                 opponent_hands.append(hand[:2])
@@ -180,6 +191,36 @@ class PokerTableState:
             return 0.0
 
         return hero_score_total / completed_simulations
+
+
+def _sample_combo_from_range(
+    combo_range: dict[tuple[Card, Card], float],
+    deck: list[Card],
+    rng: random.Random,
+) -> tuple[Card, Card] | None:
+    if not combo_range:
+        return None
+
+    available = {str(card) for card in deck}
+    candidates = []
+    weights = []
+    for combo, probability in combo_range.items():
+        first, second = combo
+        if str(first) not in available or str(second) not in available:
+            continue
+        candidates.append((first, second))
+        weights.append(max(0.0, probability))
+
+    if not candidates:
+        return None
+    if sum(weights) <= 0.0:
+        weights = [1.0] * len(candidates)
+    return rng.choices(candidates, weights=weights, k=1)[0]
+
+
+def _remove_cards_from_deck(deck: list[Card], cards: list[Card]) -> None:
+    used = {str(card) for card in cards}
+    deck[:] = [card for card in deck if str(card) not in used]
 
 
 def best_holdem_score(cards: list[Card]) -> tuple:

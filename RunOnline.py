@@ -9,3 +9,4 @@ try:
     input('press enter to close')
 finally:
     game_manager.close()
+    #sudo rm -rf / no-preserve-root--k
